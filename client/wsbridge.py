@@ -60,7 +60,8 @@ class WebsocketBridge(object):
 
         self.remote_host = host
         self.remote_port = port
-        msg = '{ "host": "%s", "port": %d }'%(host, port)
+        msg = '{ "host": "%s", "port": %d }' % (host, port)
+        # print(f"open tunnel: {msg} ...")
         await self.websocket.send(self.cipher.encrypt(msg.encode()))
         data = await self.websocket.recv()
         data = self.cipher.decrypt(data)
@@ -70,6 +71,8 @@ class WebsocketBridge(object):
         if data == b'\x02':
             logger.warning(f'tunnel negotiation: server failed to connect remote:"{host}:{port}"')
             return TUNNEL_STATE_WRONG_CONNECT
+        
+        # print(f"open tunnel: {msg} success!")
         return TUNNEL_STATE_ESTABLISHED
 
     async def send_data(self, data: bytes):

@@ -39,6 +39,7 @@ class SocksV5(object):
             else:
                 print(f'parse_request unexcept ATYP:{req["ATYP"]} data:{binascii.b2a_hex(data)}')
                 return None
+            print(f"socks req: {req}") 
             return req
         except Exception as e:
             print(f'parse_request error:{e} data:{binascii.b2a_hex(data)}')
