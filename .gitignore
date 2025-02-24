@@ -1,3 +1,7 @@
+# no .cfg files
+client.cfg
+server.cfg
+
 # no log files
 *.log
 
