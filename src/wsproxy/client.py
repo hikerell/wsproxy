@@ -103,6 +103,130 @@ class GlobalUDPTunnelManager:
             logger.info("UDP Tunnel closed")
 
 
+class GlobalTCPTunnelManager:
+    def __init__(self, ws_url, cipher):
+        self.ws_url = ws_url
+        self.cipher = cipher
+        self.ws = None
+        self.session = None
+        self.sessions = {}
+        self.lock = asyncio.Lock()
+        self.read_task = None
+        self.next_session_id = 1
+        self.pending_opens = {}
+
+    async def get_session_id(self):
+        sid = self.next_session_id
+        self.next_session_id += 1
+        return sid
+
+    async def ensure_connected(self):
+        if self.ws and not self.ws.closed:
+            return
+
+        self.session = aiohttp.ClientSession()
+        try:
+            self.ws = await self.session.ws_connect(self.ws_url)
+            req = json.dumps({"cmd": "tcp_tunnel"}).encode("utf-8")
+            await self.ws.send_bytes(self.cipher.encrypt(req))
+            resp = await self.ws.receive()
+            if resp.type == aiohttp.WSMsgType.BINARY:
+                data = self.cipher.decrypt(resp.data)
+                msg = json.loads(data)
+                if msg.get("status") != "ok":
+                    raise Exception(f"Server rejected TCP tunnel: {msg}")
+            else:
+                raise Exception("Invalid handshake response")
+            self.read_task = asyncio.create_task(self.read_loop())
+        except Exception as e:
+            if self.session:
+                await self.session.close()
+            self.ws = None
+            raise
+
+    async def open_session(self, host, port, stream):
+        await self.ensure_connected()
+        sid = await self.get_session_id()
+        self.sessions[sid] = stream
+        fut = asyncio.get_running_loop().create_future()
+        self.pending_opens[sid] = fut
+        payload = {"type": "open", "sid": sid, "host": host, "port": port}
+        data = json.dumps(payload).encode("utf-8")
+        await self.ws.send_bytes(self.cipher.encrypt(data))
+        try:
+            await asyncio.wait_for(fut, timeout=10)
+            return sid
+        except Exception:
+            self.sessions.pop(sid, None)
+            self.pending_opens.pop(sid, None)
+            return None
+
+    async def close_session(self, sid):
+        if not self.ws:
+            return
+        payload = {"type": "close", "sid": sid}
+        data = json.dumps(payload).encode("utf-8")
+        try:
+            await self.ws.send_bytes(self.cipher.encrypt(data))
+        except Exception:
+            pass
+        self.sessions.pop(sid, None)
+        self.pending_opens.pop(sid, None)
+
+    async def send_data(self, sid, data):
+        async with self.lock:
+            try:
+                await self.ensure_connected()
+                packet = struct.pack("!I", sid) + data
+                encrypted = self.cipher.encrypt(packet)
+                await self.ws.send_bytes(encrypted)
+            except Exception:
+                self.ws = None
+
+    async def read_loop(self):
+        try:
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    try:
+                        decrypted = self.cipher.decrypt(msg.data)
+                        try:
+                            j = json.loads(decrypted)
+                            t = j.get("type")
+                            if t == "open_ack":
+                                sid = j.get("sid")
+                                fut = self.pending_opens.get(sid)
+                                if fut and not fut.done():
+                                    fut.set_result(True)
+                            elif t == "close":
+                                sid = j.get("sid")
+                                stream = self.sessions.pop(sid, None)
+                                if stream:
+                                    try:
+                                        stream.writer.close()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            if len(decrypted) < 4:
+                                continue
+                            sid = struct.unpack("!I", decrypted[:4])[0]
+                            payload = decrypted[4:]
+                            stream = self.sessions.get(sid)
+                            if stream:
+                                try:
+                                    stream.writer.write(payload)
+                                    await stream.writer.drain()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except Exception:
+            pass
+        finally:
+            self.ws = None
+
+
 class UDPClientProtocol(asyncio.DatagramProtocol):
     def __init__(self, manager):
         self.manager = manager
@@ -138,6 +262,7 @@ class Socks5Proxy:
         self.local_host = local_host
         self.local_port = local_port
         self.cipher = Cipher(password)
+        self.tcp_manager = GlobalTCPTunnelManager(ws_url, self.cipher)
         self.udp_manager = GlobalUDPTunnelManager(ws_url, self.cipher)
 
     async def handle_client(self, reader, writer):
@@ -195,58 +320,33 @@ class Socks5Proxy:
             writer.close()
             return
 
-        logger.info(f"TCP Connect to {dest_addr}:{dest_port}")
+        sid = await self.tcp_manager.open_session(
+            dest_addr, dest_port, type("S", (), {"writer": writer})()
+        )
+        if not sid:
+            self.send_reply(writer, 0x01)
+            writer.close()
+            return
 
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(self.ws_url) as ws:
-                # Handshake
-                await self.send_ws_json(
-                    ws, {"cmd": "connect", "host": dest_addr, "port": dest_port}
-                )
+        writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        await writer.drain()
 
-                resp_data = await self.recv_ws_json(ws)
-                if not resp_data or resp_data.get("status") != "ok":
-                    logger.error(
-                        f"Server refused: {resp_data.get('message') if resp_data else 'Unknown'}"
-                    )
-                    self.send_reply(writer, 0x01)
-                    writer.close()
-                    return
+        async def client_to_tunnel():
+            try:
+                while True:
+                    data = await reader.read(4096)
+                    if not data:
+                        break
+                    await self.tcp_manager.send_data(sid, data)
+            except Exception:
+                pass
+            await self.tcp_manager.close_session(sid)
+            try:
+                writer.close()
+            except Exception:
+                pass
 
-                # Success Reply
-                writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-
-                # Pipe
-                async def client_to_ws():
-                    try:
-                        while True:
-                            data = await reader.read(4096)
-                            if not data:
-                                break
-                            encrypted = self.cipher.encrypt(data)
-                            await ws.send_bytes(encrypted)
-                    except Exception:
-                        pass
-                    await ws.close()
-
-                async def ws_to_client():
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.BINARY:
-                            try:
-                                decrypted = self.cipher.decrypt(msg.data)
-                                writer.write(decrypted)
-                                await writer.drain()
-                            except Exception as e:
-                                logger.error(f"Decryption error: {e}")
-                                break
-                        elif msg.type in (
-                            aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.ERROR,
-                        ):
-                            break
-
-                await asyncio.gather(client_to_ws(), ws_to_client())
+        await client_to_tunnel()
 
     async def handle_udp_associate(self, reader, writer, atyp):
         await self.read_addr(reader, atyp)

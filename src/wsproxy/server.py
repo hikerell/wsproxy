@@ -11,29 +11,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
 
 
-class UDPProxyProtocol(asyncio.DatagramProtocol):
-    def __init__(self, ws, cipher):
-        self.ws = ws
-        self.cipher = cipher
-        self.transport = None
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, addr):
-        asyncio.create_task(self.forward_to_ws(data, addr))
-
-    async def forward_to_ws(self, data, addr):
-        try:
-            # Pack source address + data
-            packed_addr = pack_addr(addr[0], addr[1])
-            payload = packed_addr + data
-            encrypted = self.cipher.encrypt(payload)
-            await self.ws.send_bytes(encrypted)
-        except Exception as e:
-            logger.error(f"Failed to forward UDP to WS: {e}")
-
-
 class UDPTunnelProtocol(asyncio.DatagramProtocol):
     def __init__(self, ws, cipher, session_id):
         self.ws = ws
@@ -96,83 +73,14 @@ async def proxy_handler(request):
             logger.error("Invalid handshake")
             return ws
 
-        cmd = handshake_data.get("cmd", "connect")
+        cmd = handshake_data.get("cmd", "tcp_tunnel")
 
         async def send_json_response(data):
             json_bytes = json.dumps(data).encode("utf-8")
             encrypted = cipher.encrypt(json_bytes)
             await ws.send_bytes(encrypted)
 
-        if cmd == "connect":
-            target_host = handshake_data.get("host")
-            target_port = handshake_data.get("port")
-
-            if not target_host or not target_port:
-                await send_json_response(
-                    {"status": "error", "message": "Missing host or port"}
-                )
-                return ws
-
-            logger.info(f"Connecting to {target_host}:{target_port}")
-            try:
-                target_reader, target_writer = await asyncio.open_connection(
-                    target_host, target_port
-                )
-            except Exception as e:
-                await send_json_response({"status": "error", "message": str(e)})
-                return ws
-
-            await send_json_response({"status": "ok"})
-
-            # Pipe data for TCP
-            async def ws_to_target():
-                async for msg in ws:
-                    if msg.type == WSMsgType.BINARY:
-                        try:
-                            decrypted = cipher.decrypt(msg.data)
-                            target_writer.write(decrypted)
-                            await target_writer.drain()
-                        except Exception as e:
-                            logger.error(f"Decryption error: {e}")
-                            break
-                    elif msg.type == WSMsgType.CLOSED or msg.type == WSMsgType.ERROR:
-                        break
-
-            async def target_to_ws():
-                try:
-                    while True:
-                        data = await target_reader.read(4096)
-                        if not data:
-                            break
-                        encrypted = cipher.encrypt(data)
-                        await ws.send_bytes(encrypted)
-                except Exception:
-                    pass
-
-            await asyncio.gather(ws_to_target(), target_to_ws())
-
-        elif cmd == "udp":
-            # Legacy Single UDP Mode
-            logger.info("Starting UDP tunnel (Legacy)")
-            loop = asyncio.get_running_loop()
-            udp_transport, protocol = await loop.create_datagram_endpoint(
-                lambda: UDPProxyProtocol(ws, cipher), local_addr=("0.0.0.0", 0)
-            )
-            await send_json_response({"status": "ok"})
-
-            async for msg in ws:
-                if msg.type == WSMsgType.BINARY:
-                    try:
-                        decrypted = cipher.decrypt(msg.data)
-                        host, port, consumed = unpack_addr(decrypted)
-                        payload = decrypted[consumed:]
-                        udp_transport.sendto(payload, (host, port))
-                    except Exception as e:
-                        logger.error(f"UDP parsing/decryption error: {e}")
-                elif msg.type == WSMsgType.CLOSED or msg.type == WSMsgType.ERROR:
-                    break
-
-        elif cmd == "udp_tunnel":
+        if cmd == "udp_tunnel":
             # Multiplexed UDP Tunnel
             logger.info("Starting UDP Tunnel Multiplexer")
             await send_json_response({"status": "ok"})
@@ -219,6 +127,101 @@ async def proxy_handler(request):
             finally:
                 for transport, _ in sessions.values():
                     transport.close()
+
+        elif cmd == "tcp_tunnel":
+            await send_json_response({"status": "ok"})
+            sessions = {}
+
+            async def target_to_ws(sid, reader):
+                try:
+                    while True:
+                        data = await reader.read(4096)
+                        if not data:
+                            break
+                        payload = struct.pack("!I", sid) + data
+                        encrypted = cipher.encrypt(payload)
+                        await ws.send_bytes(encrypted)
+                except Exception:
+                    pass
+
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.BINARY:
+                        try:
+                            decrypted = cipher.decrypt(msg.data)
+                            try:
+                                obj = json.loads(decrypted)
+                                t = obj.get("type")
+                                if t == "open":
+                                    sid = obj.get("sid")
+                                    host = obj.get("host")
+                                    port = obj.get("port")
+                                    try:
+                                        r, w = await asyncio.open_connection(host, port)
+                                        task = asyncio.create_task(target_to_ws(sid, r))
+                                        sessions[sid] = {
+                                            "reader": r,
+                                            "writer": w,
+                                            "task": task,
+                                        }
+                                        resp = {
+                                            "type": "open_ack",
+                                            "sid": sid,
+                                            "status": "ok",
+                                        }
+                                    except Exception as e:
+                                        resp = {
+                                            "type": "open_ack",
+                                            "sid": sid,
+                                            "status": "error",
+                                            "message": str(e),
+                                        }
+                                    b = json.dumps(resp).encode("utf-8")
+                                    await ws.send_bytes(cipher.encrypt(b))
+                                elif t == "close":
+                                    sid = obj.get("sid")
+                                    s = sessions.pop(sid, None)
+                                    if s:
+                                        try:
+                                            s["writer"].close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            await s["writer"].wait_closed()
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                if len(decrypted) < 4:
+                                    continue
+                                sid = struct.unpack("!I", decrypted[:4])[0]
+                                payload = decrypted[4:]
+                                s = sessions.get(sid)
+                                if s:
+                                    try:
+                                        s["writer"].write(payload)
+                                        await s["writer"].drain()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
+                        break
+            finally:
+                for s in sessions.values():
+                    try:
+                        s["writer"].close()
+                    except Exception:
+                        pass
+                    try:
+                        await s["writer"].wait_closed()
+                    except Exception:
+                        pass
+                    task = s.get("task")
+                    if task:
+                        try:
+                            task.cancel()
+                        except Exception:
+                            pass
 
         else:
             await send_json_response({"status": "error", "message": "Unknown command"})
