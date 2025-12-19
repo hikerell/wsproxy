@@ -1,0 +1,11 @@
+[project]
+name = "wsproxy"
+version = "0.1.0"
+description = "WSProxy"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.13.2", "cryptography>=46.0.3"]
+
+[project.scripts]
+wsproxy-client = "wsproxy.client:main"
+wsproxy-server = "wsproxy.server:main"
