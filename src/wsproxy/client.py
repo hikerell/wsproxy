@@ -320,6 +320,7 @@ class Socks5Proxy:
             writer.close()
             return
 
+        logger.info(f"[tcp] {dest_addr}:{dest_port}")
         sid = await self.tcp_manager.open_session(
             dest_addr, dest_port, type("S", (), {"writer": writer})()
         )
