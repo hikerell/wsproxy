@@ -31,6 +31,9 @@ class Cipher:
             return data
         if len(data) < 12:
             raise ValueError("Data too short for decryption")
-        nonce = data[:12]
-        ciphertext = data[12:]
+        
+        # Use memoryview to avoid copies during slicing
+        mv = memoryview(data)
+        nonce = mv[:12]
+        ciphertext = mv[12:]
         return self.aead.decrypt(nonce, ciphertext, None)

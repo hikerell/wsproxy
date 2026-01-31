@@ -4,6 +4,7 @@ import json
 import struct
 import argparse
 import socket
+import sys
 from aiohttp import web, WSMsgType
 from wsproxy.utils import pack_addr, unpack_addr
 from wsproxy.crypto import Cipher
@@ -120,8 +121,10 @@ async def proxy_handler(request):
 
                             # Payload starts with SOCKS5 address
                             try:
-                                host, port, consumed = unpack_addr(payload)
-                                data = payload[consumed:]
+                                # Use memoryview to avoid copies during unpacking
+                                mv_payload = memoryview(payload)
+                                host, port, consumed = unpack_addr(mv_payload)
+                                data = mv_payload[consumed:]
                             except Exception as e:
                                 logger.error(f"Address unpack error: {e}")
                                 continue
@@ -285,9 +288,15 @@ def run_server(host="0.0.0.0", port=8080, password=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="wsproxy: SOCKS5 over WebSocket Tunnel"
-    )
+    if sys.platform != "win32":
+        try:
+            import uvloop
+            uvloop.install()
+            logger.info("uvloop installed")
+        except ImportError:
+            logger.warning("uvloop not installed, using default event loop")
+
+    parser = argparse.ArgumentParser("wsproxy server")
     parser.add_argument(
         "--password", help="Encryption password (optional)", default=None
     )

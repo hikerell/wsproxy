@@ -4,6 +4,7 @@ import struct
 import socket
 import math
 import json
+import sys
 import aiohttp
 import argparse
 from wsproxy.crypto import Cipher
@@ -109,8 +110,11 @@ class GlobalUDPTunnelManager:
                         decrypted = self.cipher.decrypt(msg.data)
                         if len(decrypted) < 4:
                             continue
-                        sid = struct.unpack("!I", decrypted[:4])[0]
-                        payload = decrypted[4:]
+                        
+                        # Use memoryview to avoid copies during unpacking
+                        mv_decrypted = memoryview(decrypted)
+                        sid = struct.unpack("!I", mv_decrypted[:4])[0]
+                        payload = mv_decrypted[4:]
 
                         if sid in self.sessions:
                             self.sessions[sid].receive_from_tunnel(payload)
@@ -257,8 +261,12 @@ class GlobalTCPTunnelManager:
                         except Exception:
                             if len(decrypted) < 4:
                                 continue
-                            sid = struct.unpack("!I", decrypted[:4])[0]
-                            payload = decrypted[4:]
+                            
+                            # Use memoryview to avoid copies
+                            mv_decrypted = memoryview(decrypted)
+                            sid = struct.unpack("!I", mv_decrypted[:4])[0]
+                            payload = mv_decrypted[4:]
+                            
                             stream = self.sessions.get(sid)
                             if stream:
                                 try:
@@ -484,9 +492,15 @@ def run_client(server, port=1080, password=None, pool_size=4):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="wsproxy: SOCKS5 over WebSocket Tunnel"
-    )
+    if sys.platform != "win32":
+        try:
+            import uvloop
+            uvloop.install()
+            logger.info("uvloop installed")
+        except ImportError:
+            logger.warning("uvloop not installed, using default event loop")
+
+    parser = argparse.ArgumentParser("wsproxy client")
     parser.add_argument(
         "--password", help="Encryption password (optional)", default=None
     )
