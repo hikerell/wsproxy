@@ -34,6 +34,6 @@ class Cipher:
         
         # Use memoryview to avoid copies during slicing
         mv = memoryview(data)
-        nonce = mv[:12]
-        ciphertext = mv[12:]
+        nonce = bytes(mv[:12])  # Convert to bytes for aead.decrypt
+        ciphertext = bytes(mv[12:])  # Convert to bytes for aead.decrypt
         return self.aead.decrypt(nonce, ciphertext, None)

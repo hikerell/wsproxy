@@ -31,7 +31,7 @@ def pack_addr(host, port):
 
 def unpack_addr(data):
     """
-    Unpack SOCKS5 address format from bytes.
+    Unpack SOCKS5 address format from bytes or memoryview.
     Returns (host, port, consumed_bytes).
     """
     if not data:
@@ -41,7 +41,9 @@ def unpack_addr(data):
     if atyp == 0x01:  # IPv4
         if len(data) < 7:
             raise ValueError("Insufficient data for IPv4")
-        host = str(ipaddress.IPv4Address(data[1:5]))
+        # Convert memoryview slice to bytes for ipaddress
+        addr_bytes = bytes(data[1:5])
+        host = str(ipaddress.IPv4Address(addr_bytes))
         port = struct.unpack("!H", data[5:7])[0]
         return host, port, 7
     elif atyp == 0x03:  # Domain
@@ -50,13 +52,17 @@ def unpack_addr(data):
         addr_len = data[1]
         if len(data) < 2 + addr_len + 2:
             raise ValueError("Insufficient data for Domain")
-        host = data[2 : 2 + addr_len].decode("utf-8")
+        # Convert memoryview slice to bytes for decode
+        host_bytes = bytes(data[2 : 2 + addr_len])
+        host = host_bytes.decode("utf-8")
         port = struct.unpack("!H", data[2 + addr_len : 2 + addr_len + 2])[0]
         return host, port, 2 + addr_len + 2
     elif atyp == 0x04:  # IPv6
         if len(data) < 19:
             raise ValueError("Insufficient data for IPv6")
-        host = str(ipaddress.IPv6Address(data[1:17]))
+        # Convert memoryview slice to bytes for ipaddress
+        addr_bytes = bytes(data[1:17])
+        host = str(ipaddress.IPv6Address(addr_bytes))
         port = struct.unpack("!H", data[17:19])[0]
         return host, port, 19
     else:
