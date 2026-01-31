@@ -127,6 +127,7 @@ async def proxy_handler(request):
             finally:
                 for transport, _ in sessions.values():
                     transport.close()
+                sessions.clear()
 
         elif cmd == "tcp_tunnel":
             await send_json_response({"status": "ok"})
@@ -137,12 +138,21 @@ async def proxy_handler(request):
                     while True:
                         data = await reader.read(4096)
                         if not data:
+                            logger.info(f"Target connection closed for SID {sid}")
                             break
                         payload = struct.pack("!I", sid) + data
                         encrypted = cipher.encrypt(payload)
                         await ws.send_bytes(encrypted)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error reading from target SID {sid}: {e}")
+                finally:
+                    # Notify client about closure
+                    try:
+                        resp = {"type": "close", "sid": sid}
+                        b = json.dumps(resp).encode("utf-8")
+                        await ws.send_bytes(cipher.encrypt(b))
+                    except Exception:
+                        pass
 
             try:
                 async for msg in ws:
@@ -207,21 +217,16 @@ async def proxy_handler(request):
                     elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
             finally:
-                for s in sessions.values():
+                for sid, s in sessions.items():
                     try:
                         s["writer"].close()
-                    except Exception:
-                        pass
-                    try:
                         await s["writer"].wait_closed()
                     except Exception:
                         pass
                     task = s.get("task")
                     if task:
-                        try:
-                            task.cancel()
-                        except Exception:
-                            pass
+                        task.cancel()
+                sessions.clear()
 
         else:
             await send_json_response({"status": "error", "message": "Unknown command"})

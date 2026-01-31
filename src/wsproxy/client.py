@@ -247,9 +247,11 @@ class GlobalTCPTunnelManager:
                             elif t == "close":
                                 sid = j.get("sid")
                                 stream = self.sessions.pop(sid, None)
+                                self.sid_to_conn_idx.pop(sid, None)
                                 if stream:
                                     try:
                                         stream.writer.close()
+                                        await stream.writer.wait_closed()
                                     except Exception:
                                         pass
                         except Exception:
@@ -389,13 +391,15 @@ class Socks5Proxy:
                     if not data:
                         break
                     await self.tcp_manager.send_data(sid, data)
-            except Exception:
-                pass
-            await self.tcp_manager.close_session(sid)
-            try:
-                writer.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Client to tunnel error for SID {sid}: {e}")
+            finally:
+                await self.tcp_manager.close_session(sid)
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
         await client_to_tunnel()
 
