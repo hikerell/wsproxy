@@ -3,6 +3,7 @@ import logging
 import json
 import struct
 import argparse
+import socket
 from aiohttp import web, WSMsgType
 from wsproxy.utils import pack_addr, unpack_addr
 from wsproxy.crypto import Cipher
@@ -18,11 +19,30 @@ class UDPTunnelProtocol(asyncio.DatagramProtocol):
         self.session_id = session_id
         self.transport = None
 
+    async def _setup(self):
+        self.queue = asyncio.Queue(maxsize=100)
+        self.forward_task = asyncio.create_task(self._forward_loop())
+
     def connection_made(self, transport):
         self.transport = transport
+        asyncio.create_task(self._setup())
 
     def datagram_received(self, data, addr):
-        asyncio.create_task(self.forward_to_ws(data, addr))
+        try:
+            self.queue.put_nowait((data, addr))
+        except asyncio.QueueFull:
+            pass
+
+    async def _forward_loop(self):
+        try:
+            while True:
+                data, addr = await self.queue.get()
+                await self.forward_to_ws(data, addr)
+                self.queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"UDP forward loop error: {e}")
 
     async def forward_to_ws(self, data, addr):
         try:
@@ -136,7 +156,7 @@ async def proxy_handler(request):
             async def target_to_ws(sid, reader):
                 try:
                     while True:
-                        data = await reader.read(4096)
+                        data = await reader.read(16384)
                         if not data:
                             logger.info(f"Target connection closed for SID {sid}")
                             break
@@ -168,6 +188,11 @@ async def proxy_handler(request):
                                     port = obj.get("port")
                                     try:
                                         r, w = await asyncio.open_connection(host, port)
+                                        # Enable TCP_NODELAY
+                                        sock = w.get_extra_info("socket")
+                                        if sock:
+                                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                                        
                                         task = asyncio.create_task(target_to_ws(sid, r))
                                         sessions[sid] = {
                                             "reader": r,

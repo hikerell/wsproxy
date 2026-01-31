@@ -387,7 +387,7 @@ class Socks5Proxy:
         async def client_to_tunnel():
             try:
                 while True:
-                    data = await reader.read(4096)
+                    data = await reader.read(16384)
                     if not data:
                         break
                     await self.tcp_manager.send_data(sid, data)
@@ -464,6 +464,9 @@ class Socks5Proxy:
         server = await asyncio.start_server(
             self.handle_client, self.local_host, self.local_port
         )
+        for sock in server.sockets:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
         logger.info(f"SOCKS5 client listening on {self.local_host}:{self.local_port}")
         logger.info(f"Forwarding to {self.ws_url} with {self.pool_size} websockets")
 
