@@ -438,7 +438,7 @@ class Socks5Proxy:
                     try:
                         data = await asyncio.wait_for(reader.read(16384), timeout=60)
                     except asyncio.TimeoutError:
-                        logger.warning(f"Client connection timed out for SID {sid}")
+                        logger.warning(f"Client connection timed out for SID {sid} for {dest_addr}:{dest_port}")
                         break
 
                     if not data:
@@ -484,7 +484,7 @@ class Socks5Proxy:
                 try:
                     data = await asyncio.wait_for(reader.read(1024), timeout=60)
                 except asyncio.TimeoutError:
-                    logger.warning("UDP associate TCP connection timed out")
+                    logger.warning(f"UDP associate TCP connection timed out for localhost:{local_udp_port}")
                     break
 
                 if not data:
