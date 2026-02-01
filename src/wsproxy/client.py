@@ -18,12 +18,28 @@ class GlobalUDPTunnelManager:
         self.ws_url = ws_url
         self.cipher = cipher
         self.pool_size = pool_size
-        self.conns = []  # list of dict: {"ws": ws, "session": session, "read_task": task}
+        self.conns = []  # list of dict: {"ws": ws, "read_task": task}
         self.sessions = {}  # session_id -> protocol
         self.sid_to_conn_idx = {}  # session_id -> conn_idx
         self.lock = asyncio.Lock()
         self.next_session_id = 1
         self.next_conn_index = 0
+        self._shared_session = None
+
+    async def _get_session(self):
+        if self._shared_session is None or self._shared_session.closed:
+            self._shared_session = aiohttp.ClientSession()
+        return self._shared_session
+
+    async def close(self):
+        async with self.lock:
+            for conn in self.conns:
+                if conn:
+                    await conn["ws"].close()
+                    conn["read_task"].cancel()
+            if self._shared_session:
+                await self._shared_session.close()
+            self.conns = []
 
     async def get_session_id(self):
         async with self.lock:
@@ -55,7 +71,7 @@ class GlobalUDPTunnelManager:
         while len(self.conns) <= idx:
             self.conns.append(None)
 
-        session = aiohttp.ClientSession()
+        session = await self._get_session()
         try:
             ws = await session.ws_connect(self.ws_url, heartbeat=30)
             # Handshake for UDP Tunnel
@@ -72,13 +88,12 @@ class GlobalUDPTunnelManager:
                 raise Exception("Invalid handshake response")
 
             read_task = asyncio.create_task(self.read_loop(ws, idx))
-            self.conns[idx] = {"ws": ws, "session": session, "read_task": read_task}
+            self.conns[idx] = {"ws": ws, "read_task": read_task}
             logger.info(f"UDP Tunnel connection {idx} connected")
             return ws
 
         except Exception as e:
             logger.error(f"Failed to connect UDP tunnel {idx}: {e}")
-            await session.close()
             self.conns[idx] = None
             raise
 
@@ -136,13 +151,29 @@ class GlobalTCPTunnelManager:
         self.ws_url = ws_url
         self.cipher = cipher
         self.pool_size = pool_size
-        self.conns = []  # list of dict: {"ws": ws, "session": session, "read_task": task}
+        self.conns = []  # list of dict: {"ws": ws, "read_task": task}
         self.sessions = {}
         self.sid_to_conn_idx = {}
         self.lock = asyncio.Lock()
         self.next_session_id = 1
         self.next_conn_index = 0
         self.pending_opens = {}
+        self._shared_session = None
+
+    async def _get_session(self):
+        if self._shared_session is None or self._shared_session.closed:
+            self._shared_session = aiohttp.ClientSession()
+        return self._shared_session
+
+    async def close(self):
+        async with self.lock:
+            for conn in self.conns:
+                if conn:
+                    await conn["ws"].close()
+                    conn["read_task"].cancel()
+            if self._shared_session:
+                await self._shared_session.close()
+            self.conns = []
 
     async def get_session_id(self):
         async with self.lock:
@@ -157,7 +188,7 @@ class GlobalTCPTunnelManager:
         while len(self.conns) <= idx:
             self.conns.append(None)
 
-        session = aiohttp.ClientSession()
+        session = await self._get_session()
         try:
             ws = await session.ws_connect(self.ws_url, heartbeat=30)
             req = json.dumps({"cmd": "tcp_tunnel"}).encode("utf-8")
@@ -171,11 +202,10 @@ class GlobalTCPTunnelManager:
             else:
                 raise Exception("Invalid handshake response")
             read_task = asyncio.create_task(self.read_loop(ws, idx))
-            self.conns[idx] = {"ws": ws, "session": session, "read_task": read_task}
+            self.conns[idx] = {"ws": ws, "read_task": read_task}
             return ws
         except Exception as e:
             logger.error(f"Failed to connect TCP tunnel {idx}: {e}")
-            await session.close()
             self.conns[idx] = None
             raise
 
@@ -331,6 +361,7 @@ class Socks5Proxy:
             data = await reader.read(2)
             if not data or data[0] != 0x05:
                 writer.close()
+                await writer.wait_closed()
                 return
 
             nmethods = data[1]
@@ -341,6 +372,8 @@ class Socks5Proxy:
             # 2. Handle Request
             header = await reader.read(4)
             if not header or len(header) < 4:
+                writer.close()
+                await writer.wait_closed()
                 return
 
             ver, cmd, rsv, atyp = header
@@ -352,10 +385,15 @@ class Socks5Proxy:
             else:
                 self.send_reply(writer, 0x07)  # Command not supported
                 writer.close()
+                await writer.wait_closed()
 
         except Exception as e:
             logger.error(f"Handler error: {e}")
             writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def send_ws_json(self, ws, data):
         json_bytes = json.dumps(data).encode("utf-8")
@@ -378,6 +416,7 @@ class Socks5Proxy:
         if not dest_addr:
             self.send_reply(writer, 0x08)
             writer.close()
+            await writer.wait_closed()
             return
 
         logger.info(f"[tcp] {dest_addr}:{dest_port}")
@@ -387,6 +426,7 @@ class Socks5Proxy:
         if not sid:
             self.send_reply(writer, 0x01)
             writer.close()
+            await writer.wait_closed()
             return
 
         writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -446,6 +486,7 @@ class Socks5Proxy:
                 self.udp_manager.unregister(protocol.session_id)
             transport.close()
             writer.close()
+            await writer.wait_closed()
 
     async def read_addr(self, reader, atyp):
         if atyp == 0x01:
@@ -479,7 +520,14 @@ class Socks5Proxy:
         logger.info(f"Forwarding to {self.ws_url} with {self.pool_size} websockets")
 
         async with server:
-            await server.serve_forever()
+            try:
+                await server.serve_forever()
+            finally:
+                await self.close()
+
+    async def close(self):
+        await self.tcp_manager.close()
+        await self.udp_manager.close()
 
 
 def run_client(server, port=1080, password=None, pool_size=4):

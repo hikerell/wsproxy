@@ -24,6 +24,12 @@ class UDPTunnelProtocol(asyncio.DatagramProtocol):
         self.queue = asyncio.Queue(maxsize=100)
         self.forward_task = asyncio.create_task(self._forward_loop())
 
+    def stop(self):
+        if hasattr(self, "forward_task"):
+            self.forward_task.cancel()
+        if self.transport:
+            self.transport.close()
+
     def connection_made(self, transport):
         self.transport = transport
         asyncio.create_task(self._setup())
@@ -148,8 +154,8 @@ async def proxy_handler(request):
                     elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
             finally:
-                for transport, _ in sessions.values():
-                    transport.close()
+                for transport, protocol in sessions.values():
+                    protocol.stop()
                 sessions.clear()
 
         elif cmd == "tcp_tunnel":
