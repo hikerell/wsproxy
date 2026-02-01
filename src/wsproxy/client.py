@@ -435,7 +435,12 @@ class Socks5Proxy:
         async def client_to_tunnel():
             try:
                 while True:
-                    data = await reader.read(16384)
+                    try:
+                        data = await asyncio.wait_for(reader.read(16384), timeout=60)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Client connection timed out for SID {sid}")
+                        break
+
                     if not data:
                         break
                     await self.tcp_manager.send_data(sid, data)
@@ -476,7 +481,12 @@ class Socks5Proxy:
         # 3. Keep TCP open to maintain association
         try:
             while True:
-                data = await reader.read(1024)
+                try:
+                    data = await asyncio.wait_for(reader.read(1024), timeout=60)
+                except asyncio.TimeoutError:
+                    logger.warning("UDP associate TCP connection timed out")
+                    break
+
                 if not data:
                     break
         except Exception:
