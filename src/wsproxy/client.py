@@ -436,7 +436,7 @@ class Socks5Proxy:
             try:
                 while True:
                     try:
-                        data = await asyncio.wait_for(reader.read(16384), timeout=60)
+                        data = await asyncio.wait_for(reader.read(16384), timeout=600)
                     except asyncio.TimeoutError:
                         logger.warning(f"Client connection timed out for SID {sid} for {dest_addr}:{dest_port}")
                         break
