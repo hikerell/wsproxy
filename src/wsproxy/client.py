@@ -5,9 +5,11 @@ import socket
 import math
 import json
 import sys
+import time
 import aiohttp
 import argparse
 from wsproxy.crypto import Cipher
+# from wsproxy.utils import hexdump
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("client")
@@ -127,7 +129,8 @@ class GlobalUDPTunnelManager:
                             continue
                         
                         # Use memoryview to avoid copies during unpacking
-                        mv_decrypted = memoryview(decrypted)
+                        # mv_decrypted = memoryview(decrypted)
+                        mv_decrypted = decrypted
                         sid = struct.unpack("!I", mv_decrypted[:4])[0]
                         payload = mv_decrypted[4:]
 
@@ -140,7 +143,7 @@ class GlobalUDPTunnelManager:
         except Exception as e:
             logger.error(f"Tunnel {idx} connection lost: {e}")
         finally:
-            logger.info(f"UDP Tunnel {idx} closed")
+            # logger.info(f"UDP Tunnel {idx} closed")
             async with self.lock:
                 if idx < len(self.conns) and self.conns[idx] and self.conns[idx]["ws"] == ws:
                     self.conns[idx] = None
@@ -152,7 +155,7 @@ class GlobalTCPTunnelManager:
         self.cipher = cipher
         self.pool_size = pool_size
         self.conns = []  # list of dict: {"ws": ws, "read_task": task}
-        self.sessions = {}
+        self.tcp_relay_sessions = {}
         self.sid_to_conn_idx = {}
         self.lock = asyncio.Lock()
         self.next_session_id = 1
@@ -218,10 +221,12 @@ class GlobalTCPTunnelManager:
             
         try:
             ws = await self._ensure_conn(conn_idx)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to open TCP session [ensure_conn] for {host}:{port}: {e}")
             return None
 
-        self.sessions[sid] = stream
+        # logger.info(f"tcp tunnenel: open session with stream: {stream}")
+        self.tcp_relay_sessions[sid] = stream
         fut = asyncio.get_running_loop().create_future()
         self.pending_opens[sid] = fut
         payload = {"type": "open", "sid": sid, "host": host, "port": port}
@@ -230,12 +235,15 @@ class GlobalTCPTunnelManager:
         try:
             await asyncio.wait_for(fut, timeout=10)
             return sid
-        except Exception:
-            self.sessions.pop(sid, None)
+        except Exception as e:
+            logger.error(f"Failed to open TCP session [wait_for] for {host}:{port}: {e}")
+            logger.exception(e)
+            self.tcp_relay_sessions.pop(sid, None)
             self.pending_opens.pop(sid, None)
             return None
 
     async def close_session(self, sid):
+        # logger.info(f"**************** close session: sid={sid}")
         conn_idx = self.sid_to_conn_idx.get(sid)
         if conn_idx is not None and conn_idx < len(self.conns) and self.conns[conn_idx]:
             ws = self.conns[conn_idx]["ws"]
@@ -246,7 +254,7 @@ class GlobalTCPTunnelManager:
             except Exception:
                 pass
         
-        self.sessions.pop(sid, None)
+        self.tcp_relay_sessions.pop(sid, None)
         self.pending_opens.pop(sid, None)
         self.sid_to_conn_idx.pop(sid, None)
 
@@ -268,49 +276,59 @@ class GlobalTCPTunnelManager:
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
+                    decrypted = self.cipher.decrypt(msg.data)
                     try:
-                        decrypted = self.cipher.decrypt(msg.data)
-                        try:
-                            j = json.loads(decrypted)
-                            t = j.get("type")
-                            if t == "open_ack":
-                                sid = j.get("sid")
-                                fut = self.pending_opens.get(sid)
-                                if fut and not fut.done():
-                                    fut.set_result(True)
-                            elif t == "close":
-                                sid = j.get("sid")
-                                stream = self.sessions.pop(sid, None)
-                                self.sid_to_conn_idx.pop(sid, None)
-                                if stream:
-                                    try:
-                                        stream.writer.close()
-                                        await stream.writer.wait_closed()
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            if len(decrypted) < 4:
-                                continue
-                            
-                            # Use memoryview to avoid copies
-                            mv_decrypted = memoryview(decrypted)
-                            sid = struct.unpack("!I", mv_decrypted[:4])[0]
-                            payload = mv_decrypted[4:]
-                            
-                            stream = self.sessions.get(sid)
+                        # logger.info(f"receive decrypted data: {decrypted}")
+                        # logger.info(f"receive decrypted data with sessions: {self.tcp_relay_sessions}")
+                        j = json.loads(decrypted)
+                        t = j.get("type")
+                        # logger.info(f"tcp tunnel: proxy-client receive {t} {type(t)}")
+                        # logger.info(decrypted)
+                        if t == "open_ack":
+                            sid = j.get("sid")
+                            fut = self.pending_opens.get(sid)
+                            if fut and not fut.done():
+                                fut.set_result(True)
+                        elif t == "close":
+                            sid = j.get("sid")
+                            # logger.info(f"tcp tunnel: close with sid {sid} {type(sid)} stream: {self.tcp_relay_sessions}")
+                            stream = self.tcp_relay_sessions.pop(sid, None)
+                            self.sid_to_conn_idx.pop(sid, None)
+                            # logger.info(f"stream: {stream}")
                             if stream:
                                 try:
-                                    stream.writer.write(payload)
-                                    await stream.writer.drain()
+                                    stream.writer.close()
+                                    await stream.writer.wait_closed()
                                 except Exception:
                                     pass
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # logger.exception(e)
+                        if len(decrypted) < 4:
+                            continue
+                        
+                        # Use memoryview to avoid copies
+                        mv_decrypted = memoryview(decrypted)
+                        sid = struct.unpack("!I", mv_decrypted[:4])[0]
+                        payload = mv_decrypted[4:]
+                        
+                        # logger.info(f"before sessions.get {sid}: {self.tcp_relay_sessions}")
+                        stream = self.tcp_relay_sessions.get(sid)
+                        # logger.info(f"after sessions.get {sid}: {self.tcp_relay_sessions}")
+                        if stream:
+                            try:
+                                stream.writer.write(payload)
+                                await stream.writer.drain()
+                            except Exception as e:
+                                logger.error(e)
+                                pass
+                        # logger.info(f"continue ... with sessions: {self.tcp_relay_sessions}")
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    # logger.info(f"msg.type: {msg.type}")
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception(e)
         finally:
+            # logger.info(f"************** ws end ****************")
             async with self.lock:
                 if idx < len(self.conns) and self.conns[idx] and self.conns[idx]["ws"] == ws:
                     self.conns[idx] = None
@@ -322,6 +340,8 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
         self.transport = None
         self.client_addr = None
         self.session_id = None
+        self.last_active_time = None
+        self.init_time = time.time()
 
     def connection_made(self, transport):
         self.transport = transport
@@ -331,6 +351,8 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
         self.session_id = await self.manager.register(self)
 
     def datagram_received(self, data, addr):
+        self.last_active_time = time.time()
+        # logger.info(f"datagram_received: {len(data)} from {addr}\n{hexdump(data)}")
         self.client_addr = addr
         # Strip RSV(2)+FRAG(1) -> 3 bytes
         if len(data) < 3:
@@ -340,13 +362,25 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
             asyncio.create_task(self.manager.send(self.session_id, payload))
 
     def receive_from_tunnel(self, data):
+        self.last_active_time = time.time()
+        # logger.info(f"receive_from_tunnel: {len(data)}\n{hexdump(data)}")
         packet = b"\x00\x00\x00" + data
         if self.transport and self.client_addr:
             self.transport.sendto(packet, self.client_addr)
 
+    def is_active(self):
+        # 当30秒无数据发送，标记为不活跃
+        now = time.time()
+        if self.last_active_time is None:
+            if now - self.init_time > 10:
+                return False
+        elif now - self.last_active_time > 30:
+                return False
+        return True
+
 
 class Socks5Proxy:
-    def __init__(self, ws_url, local_host="127.0.0.1", local_port=1080, password=None, pool_size=4):
+    def __init__(self, ws_url, local_host="0.0.0.0", local_port=1080, password=None, pool_size=4):
         self.ws_url = ws_url
         self.local_host = local_host
         self.local_port = local_port
@@ -383,12 +417,13 @@ class Socks5Proxy:
             elif cmd == 0x03:  # UDP ASSOCIATE
                 await self.handle_udp_associate(reader, writer, atyp)
             else:
+                logger.warning(f"Socks5 Proxy Not Support CMD {cmd}")
                 self.send_reply(writer, 0x07)  # Command not supported
                 writer.close()
                 await writer.wait_closed()
 
         except Exception as e:
-            logger.error(f"Handler error: {e}")
+            logger.exception(e)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -424,6 +459,7 @@ class Socks5Proxy:
             dest_addr, dest_port, type("S", (), {"writer": writer})()
         )
         if not sid:
+            logger.warning(f"Failed to open TCP session for {dest_addr}:{dest_port}")
             self.send_reply(writer, 0x01)
             writer.close()
             await writer.wait_closed()
@@ -436,13 +472,16 @@ class Socks5Proxy:
             try:
                 while True:
                     try:
+                        # logger.info(f"TCP client to tunnel: read and wait 600s for {dest_addr}:{dest_port}")
                         data = await asyncio.wait_for(reader.read(16384), timeout=600)
                     except asyncio.TimeoutError:
-                        logger.warning(f"Client connection timed out for SID {sid} for {dest_addr}:{dest_port}")
+                        # logger.warning(f"TCP client to tunnel: timeout with SID {sid} for {dest_addr}:{dest_port}")
                         break
 
                     if not data:
+                        # logger.info(f"*********** no data")
                         break
+                    # logger.info(f"TCP client to tunnel: send {len(data)} bytes for {dest_addr}:{dest_port}")
                     await self.tcp_manager.send_data(sid, data)
             except Exception as e:
                 logger.error(f"Client to tunnel error for SID {sid}: {e}")
@@ -459,22 +498,26 @@ class Socks5Proxy:
     async def handle_udp_associate(self, reader, writer, atyp):
         await self.read_addr(reader, atyp)
 
-        # 1. Bind a local UDP port
         loop = asyncio.get_running_loop()
 
+        # 获取客户端建立 TCP 时连接的代理服务器 IP
+        server_ip = writer.get_extra_info('sockname')[0]
+
+        # 1. 绑定到 0.0.0.0 以接受外部连接
+        udp_client_protocol = UDPClientProtocol(self.udp_manager)
         transport, protocol = await loop.create_datagram_endpoint(
-            lambda: UDPClientProtocol(self.udp_manager), local_addr=("127.0.0.1", 0)
+            lambda: udp_client_protocol, 
+            local_addr=('0.0.0.0', 0)
         )
+        bound_port = transport.get_extra_info("sockname")[1]
 
-        local_udp_port = transport.get_extra_info("sockname")[1]
-        logger.info(f"UDP Associate bound to 127.0.0.1:{local_udp_port}")
-
-        # 2. Reply to client with BND.ADDR/PORT
+        # 2. 回复给客户端它能连通的 IP
         reply = (
             struct.pack("!BBBB", 5, 0, 0, 1)
-            + socket.inet_aton("127.0.0.1")
-            + struct.pack("!H", local_udp_port)
+            + socket.inet_aton(server_ip) # 不要硬编码 127.0.0.1
+            + struct.pack("!H", bound_port)
         )
+
         writer.write(reply)
         await writer.drain()
 
@@ -482,16 +525,18 @@ class Socks5Proxy:
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(reader.read(1024), timeout=60)
+                    logger.info(f"UDP associate TCP connection read udp data for {server_ip}:{bound_port}")
+                    data = await asyncio.wait_for(reader.read(1024), timeout=3)
+                    if not data:
+                        break
                 except asyncio.TimeoutError:
-                    logger.warning(f"UDP associate TCP connection timed out for localhost:{local_udp_port}")
-                    break
-
-                if not data:
-                    break
-        except Exception:
-            pass
+                    # 检查UDP连接是否活跃
+                    if not udp_client_protocol.is_active():
+                        break
+        except Exception as e:
+            logger.warning(f"UDP associate TCP connection {server_ip}:{bound_port} error:{e}")
         finally:
+            logger.warning(f"UDP associate TCP connection {server_ip}:{bound_port} closing ...")
             if protocol.session_id:
                 self.udp_manager.unregister(protocol.session_id)
             transport.close()
@@ -542,7 +587,7 @@ class Socks5Proxy:
 
 def run_client(server, port=1080, password=None, pool_size=4):
     ws_url = f"http://{server}/proxy"
-    proxy = Socks5Proxy(ws_url, local_port=port, password=password, pool_size=pool_size)
+    proxy = Socks5Proxy(ws_url, local_host="0.0.0.0", local_port=port, password=password, pool_size=pool_size)
     try:
         asyncio.run(proxy.start())
     except KeyboardInterrupt:

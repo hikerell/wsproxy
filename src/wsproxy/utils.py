@@ -67,3 +67,24 @@ def unpack_addr(data):
         return host, port, 19
     else:
         raise ValueError(f"Unknown address type: {atyp}")
+
+def hexdump(data):
+    """
+    将字节序列以十六进制和可打印字符形式输出，类似 hexdump -C 的效果。
+    返回字符串，每行格式：
+    00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f  |................|
+    """
+    if not data:
+        return ""
+    lines = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hex_parts = []
+        ascii_parts = []
+        for j, b in enumerate(chunk):
+            hex_parts.append(f"{b:02x}")
+            ascii_parts.append(chr(b) if 32 <= b <= 126 else ".")
+        hex_line = " ".join(hex_parts[:8]) + "  " + " ".join(hex_parts[8:]) if len(hex_parts) > 8 else " ".join(hex_parts)
+        ascii_line = "".join(ascii_parts)
+        lines.append(f"{i:08x}  {hex_line:<47}  |{ascii_line}|")
+    return "\n".join(lines)
