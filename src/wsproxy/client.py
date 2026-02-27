@@ -27,6 +27,7 @@ class GlobalUDPTunnelManager:
         self.next_session_id = 1
         self.next_conn_index = 0
         self._shared_session = None
+        self.conn_init_locks = []
 
     async def _get_session(self):
         if self._shared_session is None or self._shared_session.closed:
@@ -72,52 +73,55 @@ class GlobalUDPTunnelManager:
         # Expand conns list if needed
         while len(self.conns) <= idx:
             self.conns.append(None)
+        while len(self.conn_init_locks) <= idx:
+            self.conn_init_locks.append(asyncio.Lock())
 
-        session = await self._get_session()
-        try:
-            ws = await session.ws_connect(self.ws_url, heartbeat=30)
-            # Handshake for UDP Tunnel
-            req = json.dumps({"cmd": "udp_tunnel"}).encode("utf-8")
-            await ws.send_bytes(self.cipher.encrypt(req))
+        # Avoid concurrent reconnect attempts for the same tunnel index
+        async with self.conn_init_locks[idx]:
+            if idx < len(self.conns) and self.conns[idx] and not self.conns[idx]["ws"].closed:
+                return self.conns[idx]["ws"]
 
-            resp = await ws.receive()
-            if resp.type == aiohttp.WSMsgType.BINARY:
-                data = self.cipher.decrypt(resp.data)
-                msg = json.loads(data)
-                if msg.get("status") != "ok":
-                    raise Exception(f"Server rejected UDP tunnel: {msg}")
-            else:
-                raise Exception("Invalid handshake response")
+            session = await self._get_session()
+            try:
+                ws = await session.ws_connect(self.ws_url, heartbeat=30)
+                # Handshake for UDP Tunnel
+                req = json.dumps({"cmd": "udp_tunnel"}).encode("utf-8")
+                await ws.send_bytes(self.cipher.encrypt(req))
 
-            read_task = asyncio.create_task(self.read_loop(ws, idx))
-            self.conns[idx] = {"ws": ws, "read_task": read_task}
-            logger.info(f"UDP Tunnel connection {idx} connected")
-            return ws
+                resp = await ws.receive()
+                if resp.type == aiohttp.WSMsgType.BINARY:
+                    data = self.cipher.decrypt(resp.data)
+                    msg = json.loads(data)
+                    if msg.get("status") != "ok":
+                        raise Exception(f"Server rejected UDP tunnel: {msg}")
+                else:
+                    raise Exception("Invalid handshake response")
 
-        except Exception as e:
-            logger.error(f"Failed to connect UDP tunnel {idx}: {e}")
-            self.conns[idx] = None
-            raise
+                read_task = asyncio.create_task(self.read_loop(ws, idx))
+                self.conns[idx] = {"ws": ws, "read_task": read_task}
+                logger.info(f"UDP Tunnel connection {idx} connected")
+                return ws
+
+            except Exception as e:
+                logger.error(f"Failed to connect UDP tunnel {idx}: {e}")
+                self.conns[idx] = None
+                raise
 
     async def send(self, session_id, data):
-        async with self.lock:
-            try:
-                conn_idx = self.sid_to_conn_idx.get(session_id)
-                if conn_idx is None:
-                    return
-                
-                ws_info = await self._ensure_conn(conn_idx)
-                # ws_info is actually ws here based on _ensure_conn return
-                ws = ws_info
-                
-                # Packet: [SessionID 4B] + Data
-                packet = struct.pack("!I", session_id) + data
-                encrypted = self.cipher.encrypt(packet)
-                await ws.send_bytes(encrypted)
-            except Exception as e:
-                logger.error(f"Tunnel send error on session {session_id}: {e}")
-                if conn_idx is not None and conn_idx < len(self.conns):
-                    self.conns[conn_idx] = None
+        conn_idx = self.sid_to_conn_idx.get(session_id)
+        if conn_idx is None:
+            return
+
+        try:
+            ws = await self._ensure_conn(conn_idx)
+            # Packet: [SessionID 4B] + Data
+            packet = struct.pack("!I", session_id) + data
+            encrypted = self.cipher.encrypt(packet)
+            await ws.send_bytes(encrypted)
+        except Exception as e:
+            logger.error(f"Tunnel send error on session {session_id}: {e}")
+            if conn_idx < len(self.conns):
+                self.conns[conn_idx] = None
 
     async def read_loop(self, ws, idx):
         try:
@@ -342,6 +346,8 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
         self.session_id = None
         self.last_active_time = None
         self.init_time = time.time()
+        self.send_queue = asyncio.Queue(maxsize=2048)
+        self.sender_task = None
 
     def connection_made(self, transport):
         self.transport = transport
@@ -349,6 +355,17 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
 
     async def register(self):
         self.session_id = await self.manager.register(self)
+        self.sender_task = asyncio.create_task(self._sender_loop())
+
+    async def _sender_loop(self):
+        try:
+            while True:
+                payload = await self.send_queue.get()
+                if self.session_id:
+                    await self.manager.send(self.session_id, payload)
+                self.send_queue.task_done()
+        except asyncio.CancelledError:
+            pass
 
     def datagram_received(self, data, addr):
         self.last_active_time = time.time()
@@ -359,7 +376,14 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
             return
         payload = data[3:]
         if self.session_id:
-            asyncio.create_task(self.manager.send(self.session_id, payload))
+            try:
+                self.send_queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+    def connection_lost(self, exc):
+        if self.sender_task:
+            self.sender_task.cancel()
 
     def receive_from_tunnel(self, data):
         self.last_active_time = time.time()
@@ -387,7 +411,7 @@ class Socks5Proxy:
         self.cipher = Cipher(password)
         self.pool_size = pool_size
         self.tcp_manager = GlobalTCPTunnelManager(ws_url, self.cipher, pool_size=pool_size)
-        self.udp_manager = GlobalUDPTunnelManager(ws_url, self.cipher, pool_size=min(math.floor(pool_size / 2), 1))
+        self.udp_manager = GlobalUDPTunnelManager(ws_url, self.cipher, pool_size=max(math.floor(pool_size / 2), 1))
 
     async def handle_client(self, reader, writer):
         try:
@@ -525,7 +549,6 @@ class Socks5Proxy:
         try:
             while True:
                 try:
-                    logger.info(f"UDP associate TCP connection read udp data for {server_ip}:{bound_port}")
                     data = await asyncio.wait_for(reader.read(1024), timeout=3)
                     if not data:
                         break

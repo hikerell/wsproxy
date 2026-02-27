@@ -19,20 +19,19 @@ class UDPTunnelProtocol(asyncio.DatagramProtocol):
         self.cipher = cipher
         self.session_id = session_id
         self.transport = None
-
-    async def _setup(self):
-        self.queue = asyncio.Queue(maxsize=100)
-        self.forward_task = asyncio.create_task(self._forward_loop())
+        self.queue = asyncio.Queue(maxsize=2048)
+        self.forward_task = None
 
     def stop(self):
         if hasattr(self, "forward_task"):
-            self.forward_task.cancel()
+            if self.forward_task:
+                self.forward_task.cancel()
         if self.transport:
             self.transport.close()
 
     def connection_made(self, transport):
         self.transport = transport
-        asyncio.create_task(self._setup())
+        self.forward_task = asyncio.create_task(self._forward_loop())
 
     def datagram_received(self, data, addr):
         try:
