@@ -1,6 +1,14 @@
 import struct
 import ipaddress
 
+TCP_FRAME_OPEN = 1
+TCP_FRAME_OPEN_ACK = 2
+TCP_FRAME_DATA = 3
+TCP_FRAME_CLOSE = 4
+TCP_FRAME_ERROR = 5
+
+TCP_FRAME_HEADER = struct.Struct("!BII")
+
 
 def pack_addr(host, port):
     """
@@ -87,6 +95,44 @@ def normalize_host(host):
         return str(ip)
     except ValueError:
         return host
+
+
+def pack_tcp_frame(frame_type, sid, payload=b""):
+    """
+    Pack one TCP tunnel frame:
+    | type(1) | sid(4) | len(4) | payload(len) |
+    """
+    if payload is None:
+        payload = b""
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TypeError("payload must be bytes-like")
+    if isinstance(payload, memoryview):
+        payload = payload.tobytes()
+    elif isinstance(payload, bytearray):
+        payload = bytes(payload)
+    return TCP_FRAME_HEADER.pack(frame_type, sid, len(payload)) + payload
+
+
+def iter_tcp_frames(data):
+    """
+    Iterate frames from one decrypted websocket payload.
+    Returns (frame_type, sid, payload_memoryview).
+    """
+    mv = memoryview(data)
+    offset = 0
+    total = len(mv)
+    hsize = TCP_FRAME_HEADER.size
+
+    while offset < total:
+        if total - offset < hsize:
+            raise ValueError("truncated tcp frame header")
+        frame_type, sid, payload_len = TCP_FRAME_HEADER.unpack_from(mv, offset)
+        offset += hsize
+        if payload_len < 0 or total - offset < payload_len:
+            raise ValueError("truncated tcp frame payload")
+        payload = mv[offset : offset + payload_len]
+        offset += payload_len
+        yield frame_type, sid, payload
 
 def hexdump(data):
     """

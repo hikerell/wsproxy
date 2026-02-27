@@ -6,11 +6,30 @@ import argparse
 import socket
 import sys
 from aiohttp import web, WSMsgType
-from wsproxy.utils import pack_addr, unpack_addr, normalize_host
+from wsproxy.utils import (
+    pack_addr,
+    unpack_addr,
+    normalize_host,
+    pack_tcp_frame,
+    iter_tcp_frames,
+    TCP_FRAME_OPEN,
+    TCP_FRAME_OPEN_ACK,
+    TCP_FRAME_DATA,
+    TCP_FRAME_CLOSE,
+)
 from wsproxy.crypto import Cipher
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("server")
+
+TCP_READ_CHUNK_SIZE = 65536
+TCP_REMOTE_DRAIN_THRESHOLD = 64 * 1024
+TCP_REMOTE_BUFFER_THRESHOLD = 128 * 1024
+TCP_WS_CTRL_SEND_QUEUE_SIZE = 1024
+TCP_WS_DATA_SEND_QUEUE_SIZE = 4096
+TCP_WS_BATCH_MAX_FRAMES = 16
+TCP_WS_BATCH_MAX_BYTES = 64 * 1024
+TCP_WS_BATCH_WAIT_SECONDS = 0.001
 
 
 class UDPTunnelProtocol(asyncio.DatagramProtocol):
@@ -63,7 +82,11 @@ class UDPTunnelProtocol(asyncio.DatagramProtocol):
 
 
 async def proxy_handler(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(
+        compress=False,
+        max_msg_size=16 * 1024 * 1024,
+        writer_limit=1 * 1024 * 1024,
+    )
     await ws.prepare(request)
 
     password = request.app.get("password")
@@ -160,113 +183,198 @@ async def proxy_handler(request):
         elif cmd == "tcp_tunnel":
             await send_json_response({"status": "ok"})
             sessions = {}
+            ctrl_send_queue = asyncio.Queue(maxsize=TCP_WS_CTRL_SEND_QUEUE_SIZE)
+            data_send_queue = asyncio.Queue(maxsize=TCP_WS_DATA_SEND_QUEUE_SIZE)
+
+            def encode_open_ack(ok, message=""):
+                if ok:
+                    return b"\x00"
+                msg = (message or "open session failed").encode("utf-8", errors="replace")
+                if len(msg) > 1024:
+                    msg = msg[:1024]
+                return b"\x01" + msg
+
+            def is_control_frame(frame_type):
+                return frame_type in (TCP_FRAME_OPEN_ACK, TCP_FRAME_CLOSE)
+
+            async def queue_frame(frame_type, sid, payload=b""):
+                frame = pack_tcp_frame(frame_type, sid, payload)
+                if is_control_frame(frame_type):
+                    await ctrl_send_queue.put(frame)
+                else:
+                    await data_send_queue.put(frame)
+
+            async def pop_next_outbound():
+                try:
+                    return "ctrl", ctrl_send_queue, ctrl_send_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    return "data", data_send_queue, data_send_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                get_ctrl = asyncio.create_task(ctrl_send_queue.get())
+                get_data = asyncio.create_task(data_send_queue.get())
+                done, pending = await asyncio.wait(
+                    [get_ctrl, get_data], return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                first = done.pop()
+                if first is get_ctrl:
+                    return "ctrl", ctrl_send_queue, first.result()
+                return "data", data_send_queue, first.result()
+
+            async def ws_sender_loop():
+                loop = asyncio.get_running_loop()
+                try:
+                    while True:
+                        queue_kind, queue_ref, first = await pop_next_outbound()
+                        queue_ref.task_done()
+
+                        if queue_kind == "ctrl":
+                            await ws.send_bytes(cipher.encrypt(first))
+                            continue
+
+                        batch = [first]
+                        total_bytes = len(first)
+                        deadline = loop.time() + TCP_WS_BATCH_WAIT_SECONDS
+
+                        while (
+                            len(batch) < TCP_WS_BATCH_MAX_FRAMES
+                            and total_bytes < TCP_WS_BATCH_MAX_BYTES
+                        ):
+                            if not ctrl_send_queue.empty():
+                                break
+                            timeout = deadline - loop.time()
+                            if timeout <= 0:
+                                break
+                            try:
+                                frame = await asyncio.wait_for(data_send_queue.get(), timeout=timeout)
+                            except asyncio.TimeoutError:
+                                break
+                            data_send_queue.task_done()
+                            batch.append(frame)
+                            total_bytes += len(frame)
+
+                        merged = b"".join(batch)
+                        await ws.send_bytes(cipher.encrypt(merged))
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"TCP sender loop error: {e}")
+
+            async def close_target_session(sid, notify_client=False):
+                s = sessions.pop(sid, None)
+                if not s:
+                    return
+                task = s.get("task")
+                current = asyncio.current_task()
+                if task and task is not current:
+                    task.cancel()
+                writer = s.get("writer")
+                if writer:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                if notify_client:
+                    try:
+                        await queue_frame(TCP_FRAME_CLOSE, sid)
+                    except Exception:
+                        pass
 
             async def target_to_ws(sid, reader):
                 try:
                     while True:
-                        data = await reader.read(16384)
+                        data = await reader.read(TCP_READ_CHUNK_SIZE)
                         if not data:
-                            logger.info(f"Target connection closed for SID {sid}")
                             break
-                        payload = struct.pack("!I", sid) + data
-                        encrypted = cipher.encrypt(payload)
-                        await ws.send_bytes(encrypted)
+                        await queue_frame(TCP_FRAME_DATA, sid, data)
                 except Exception as e:
                     logger.error(f"Error reading from target SID {sid}: {e}")
                 finally:
-                    # Notify client about closure
-                    try:
-                        resp = {"type": "close", "sid": sid}
-                        b = json.dumps(resp).encode("utf-8")
-                        await ws.send_bytes(cipher.encrypt(b))
-                    except Exception:
-                        pass
+                    await close_target_session(sid, notify_client=True)
 
+            sender_task = asyncio.create_task(ws_sender_loop())
             try:
                 async for msg in ws:
                     if msg.type == WSMsgType.BINARY:
                         try:
                             decrypted = cipher.decrypt(msg.data)
-                            try:
-                                obj = json.loads(decrypted)
-                                t = obj.get("type")
-                                if t == "open":
-                                    sid = obj.get("sid")
-                                    host = obj.get("host")
-                                    port = obj.get("port")
+                            for frame_type, sid, payload in iter_tcp_frames(decrypted):
+                                if frame_type == TCP_FRAME_OPEN:
                                     try:
+                                        host, port, consumed = unpack_addr(payload)
+                                        if consumed != len(payload):
+                                            raise ValueError("invalid OPEN payload length")
+
                                         normalized_host = normalize_host(host)
                                         r, w = await asyncio.wait_for(
                                             asyncio.open_connection(normalized_host, port),
                                             timeout=10,
                                         )
-                                        # Enable TCP_NODELAY
                                         sock = w.get_extra_info("socket")
                                         if sock:
                                             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                                        
+
                                         task = asyncio.create_task(target_to_ws(sid, r))
                                         sessions[sid] = {
                                             "reader": r,
                                             "writer": w,
                                             "task": task,
+                                            "drain_pending": 0,
                                         }
-                                        resp = {
-                                            "type": "open_ack",
-                                            "sid": sid,
-                                            "status": "ok",
-                                        }
+                                        await queue_frame(TCP_FRAME_OPEN_ACK, sid, encode_open_ack(True))
                                     except Exception as e:
-                                        resp = {
-                                            "type": "open_ack",
-                                            "sid": sid,
-                                            "status": "error",
-                                            "message": str(e),
-                                        }
-                                    b = json.dumps(resp).encode("utf-8")
-                                    await ws.send_bytes(cipher.encrypt(b))
-                                elif t == "close":
-                                    sid = obj.get("sid")
-                                    s = sessions.pop(sid, None)
-                                    if s:
-                                        try:
-                                            s["writer"].close()
-                                        except Exception:
-                                            pass
-                                        try:
-                                            await s["writer"].wait_closed()
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                if len(decrypted) < 4:
-                                    continue
-                                sid = struct.unpack("!I", decrypted[:4])[0]
-                                payload = decrypted[4:]
-                                s = sessions.get(sid)
-                                if s:
+                                        await queue_frame(
+                                            TCP_FRAME_OPEN_ACK,
+                                            sid,
+                                            encode_open_ack(False, f"server: {str(e)}"),
+                                        )
+                                elif frame_type == TCP_FRAME_DATA:
+                                    s = sessions.get(sid)
+                                    if not s:
+                                        continue
+                                    writer = s.get("writer")
+                                    if not writer:
+                                        continue
                                     try:
-                                        s["writer"].write(payload)
-                                        await s["writer"].drain()
+                                        writer.write(payload)
+                                        pending = s.get("drain_pending", 0) + len(payload)
+                                        transport = getattr(writer, "transport", None)
+                                        if pending >= TCP_REMOTE_DRAIN_THRESHOLD or (
+                                            transport
+                                            and transport.get_write_buffer_size() >= TCP_REMOTE_BUFFER_THRESHOLD
+                                        ):
+                                            await writer.drain()
+                                            pending = 0
+                                        s["drain_pending"] = pending
                                     except Exception:
-                                        pass
-                        except Exception:
-                            pass
+                                        await close_target_session(sid)
+                                elif frame_type == TCP_FRAME_CLOSE:
+                                    await close_target_session(sid)
+                        except Exception as e:
+                            logger.error(f"TCP tunnel frame error: {e}")
                     elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
             finally:
-                for sid, s in sessions.items():
-                    try:
-                        s["writer"].close()
-                        await s["writer"].wait_closed()
-                    except Exception:
-                        pass
-                    task = s.get("task")
-                    if task:
-                        task.cancel()
+                sender_task.cancel()
+                await asyncio.gather(sender_task, return_exceptions=True)
+                for sid in list(sessions.keys()):
+                    await close_target_session(sid)
                 sessions.clear()
 
         else:
-            await send_json_response({"status": "error", "message": "Unknown command"})
+            await send_json_response({"status": "error", "message": "server: Unknown command"})
             return ws
 
     except Exception as e:

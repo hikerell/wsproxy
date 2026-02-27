@@ -9,11 +9,29 @@ import time
 import aiohttp
 import argparse
 from wsproxy.crypto import Cipher
-from wsproxy.utils import normalize_host
+from wsproxy.utils import (
+    normalize_host,
+    pack_addr,
+    pack_tcp_frame,
+    iter_tcp_frames,
+    TCP_FRAME_OPEN,
+    TCP_FRAME_OPEN_ACK,
+    TCP_FRAME_DATA,
+    TCP_FRAME_CLOSE,
+)
 # from wsproxy.utils import hexdump
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("client")
+
+TCP_READ_CHUNK_SIZE = 65536
+TCP_LOCAL_DRAIN_THRESHOLD = 64 * 1024
+TCP_LOCAL_BUFFER_THRESHOLD = 128 * 1024
+TCP_WS_CTRL_SEND_QUEUE_SIZE = 1024
+TCP_WS_DATA_SEND_QUEUE_SIZE = 4096
+TCP_WS_BATCH_MAX_FRAMES = 16
+TCP_WS_BATCH_MAX_BYTES = 64 * 1024
+TCP_WS_BATCH_WAIT_SECONDS = 0.001
 
 
 class GlobalUDPTunnelManager:
@@ -84,7 +102,12 @@ class GlobalUDPTunnelManager:
 
             session = await self._get_session()
             try:
-                ws = await session.ws_connect(self.ws_url, heartbeat=30)
+                ws = await session.ws_connect(
+                    self.ws_url,
+                    heartbeat=30,
+                    compress=0,
+                    max_msg_size=16 * 1024 * 1024,
+                )
                 # Handshake for UDP Tunnel
                 req = json.dumps({"cmd": "udp_tunnel"}).encode("utf-8")
                 await ws.send_bytes(self.cipher.encrypt(req))
@@ -159,7 +182,7 @@ class GlobalTCPTunnelManager:
         self.ws_url = ws_url
         self.cipher = cipher
         self.pool_size = pool_size
-        self.conns = []  # list of dict: {"ws": ws, "read_task": task}
+        self.conns = []  # list of dict: {"ws", "read_task", "send_task", "ctrl_send_queue", "data_send_queue"}
         self.tcp_relay_sessions = {}
         self.sid_to_conn_idx = {}
         self.lock = asyncio.Lock()
@@ -167,11 +190,20 @@ class GlobalTCPTunnelManager:
         self.next_conn_index = 0
         self.pending_opens = {}
         self._shared_session = None
+        self.conn_init_locks = []
 
     async def _get_session(self):
         if self._shared_session is None or self._shared_session.closed:
             self._shared_session = aiohttp.ClientSession()
         return self._shared_session
+
+    @staticmethod
+    def _decode_open_ack(payload):
+        if not payload:
+            return False, "empty open_ack payload"
+        status = payload[0]
+        message = bytes(payload[1:]).decode("utf-8", errors="replace") if len(payload) > 1 else ""
+        return status == 0, message
 
     async def close(self):
         async with self.lock:
@@ -179,9 +211,27 @@ class GlobalTCPTunnelManager:
                 if conn:
                     await conn["ws"].close()
                     conn["read_task"].cancel()
+                    conn["send_task"].cancel()
+            for fut in self.pending_opens.values():
+                if fut and not fut.done():
+                    fut.set_exception(RuntimeError("tcp tunnel manager closed"))
+            self.pending_opens.clear()
+            sessions = list(self.tcp_relay_sessions.values())
+            self.tcp_relay_sessions.clear()
+            self.sid_to_conn_idx.clear()
             if self._shared_session:
                 await self._shared_session.close()
             self.conns = []
+
+        for session in sessions:
+            writer = session.get("writer")
+            if not writer:
+                continue
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def get_session_id(self):
         async with self.lock:
@@ -189,35 +239,159 @@ class GlobalTCPTunnelManager:
             self.next_session_id += 1
             return sid
 
+    async def _mark_conn_disconnected(self, idx, ws):
+        read_task = None
+        send_task = None
+        async with self.lock:
+            if idx < len(self.conns) and self.conns[idx] and self.conns[idx]["ws"] == ws:
+                conn = self.conns[idx]
+                read_task = conn.get("read_task")
+                send_task = conn.get("send_task")
+                self.conns[idx] = None
+
+        current = asyncio.current_task()
+        for task in (read_task, send_task):
+            if task and task is not current:
+                task.cancel()
+
+    async def _cleanup_conn_sessions(self, idx, reason):
+        impacted = [sid for sid, conn_idx in self.sid_to_conn_idx.items() if conn_idx == idx]
+        for sid in impacted:
+            fut = self.pending_opens.pop(sid, None)
+            if fut and not fut.done():
+                fut.set_exception(RuntimeError(reason))
+            session = self.tcp_relay_sessions.pop(sid, None)
+            self.sid_to_conn_idx.pop(sid, None)
+            if not session:
+                continue
+            writer = session.get("writer")
+            if writer:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def _pop_next_outbound(self, ctrl_send_queue, data_send_queue):
+        try:
+            return "ctrl", ctrl_send_queue, ctrl_send_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            return "data", data_send_queue, data_send_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        get_ctrl = asyncio.create_task(ctrl_send_queue.get())
+        get_data = asyncio.create_task(data_send_queue.get())
+        done, pending = await asyncio.wait(
+            [get_ctrl, get_data], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        first = done.pop()
+        if first is get_ctrl:
+            return "ctrl", ctrl_send_queue, first.result()
+        return "data", data_send_queue, first.result()
+
+    async def send_loop(self, ws, idx, ctrl_send_queue, data_send_queue):
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                queue_kind, queue_ref, first = await self._pop_next_outbound(
+                    ctrl_send_queue, data_send_queue
+                )
+                queue_ref.task_done()
+
+                if queue_kind == "ctrl":
+                    await ws.send_bytes(self.cipher.encrypt(first))
+                    continue
+
+                batch = [first]
+                total_bytes = len(first)
+                deadline = loop.time() + TCP_WS_BATCH_WAIT_SECONDS
+
+                while (
+                    len(batch) < TCP_WS_BATCH_MAX_FRAMES
+                    and total_bytes < TCP_WS_BATCH_MAX_BYTES
+                ):
+                    if not ctrl_send_queue.empty():
+                        break
+                    timeout = deadline - loop.time()
+                    if timeout <= 0:
+                        break
+                    try:
+                        frame = await asyncio.wait_for(data_send_queue.get(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        break
+                    data_send_queue.task_done()
+                    batch.append(frame)
+                    total_bytes += len(frame)
+
+                await ws.send_bytes(self.cipher.encrypt(b"".join(batch)))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"TCP tunnel {idx} sender loop error: {e}")
+        finally:
+            await self._mark_conn_disconnected(idx, ws)
+
     async def _ensure_conn(self, idx):
         if idx < len(self.conns) and self.conns[idx] and not self.conns[idx]["ws"].closed:
-            return self.conns[idx]["ws"]
+            return self.conns[idx]
 
         while len(self.conns) <= idx:
             self.conns.append(None)
+        while len(self.conn_init_locks) <= idx:
+            self.conn_init_locks.append(asyncio.Lock())
 
-        session = await self._get_session()
-        try:
-            ws = await session.ws_connect(self.ws_url, heartbeat=30)
-            req = json.dumps({"cmd": "tcp_tunnel"}).encode("utf-8")
-            await ws.send_bytes(self.cipher.encrypt(req))
-            resp = await ws.receive()
-            if resp.type == aiohttp.WSMsgType.BINARY:
-                data = self.cipher.decrypt(resp.data)
-                msg = json.loads(data)
-                if msg.get("status") != "ok":
-                    raise Exception(f"Server rejected TCP tunnel: {msg}")
-            else:
-                raise Exception("Invalid handshake response")
-            read_task = asyncio.create_task(self.read_loop(ws, idx))
-            self.conns[idx] = {"ws": ws, "read_task": read_task}
-            return ws
-        except Exception as e:
-            logger.error(f"Failed to connect TCP tunnel {idx}: {e}")
-            self.conns[idx] = None
-            raise
+        async with self.conn_init_locks[idx]:
+            if idx < len(self.conns) and self.conns[idx] and not self.conns[idx]["ws"].closed:
+                return self.conns[idx]
 
-    async def open_session(self, host, port, stream):
+            session = await self._get_session()
+            try:
+                ws = await session.ws_connect(
+                    self.ws_url,
+                    heartbeat=30,
+                    compress=0,
+                    max_msg_size=16 * 1024 * 1024,
+                )
+                req = json.dumps({"cmd": "tcp_tunnel"}).encode("utf-8")
+                await ws.send_bytes(self.cipher.encrypt(req))
+                resp = await ws.receive()
+                if resp.type == aiohttp.WSMsgType.BINARY:
+                    data = self.cipher.decrypt(resp.data)
+                    msg = json.loads(data)
+                    if msg.get("status") != "ok":
+                        raise Exception(f"Server rejected TCP tunnel: {msg}")
+                else:
+                    raise Exception("Invalid handshake response")
+
+                ctrl_send_queue = asyncio.Queue(maxsize=TCP_WS_CTRL_SEND_QUEUE_SIZE)
+                data_send_queue = asyncio.Queue(maxsize=TCP_WS_DATA_SEND_QUEUE_SIZE)
+                send_task = asyncio.create_task(
+                    self.send_loop(ws, idx, ctrl_send_queue, data_send_queue)
+                )
+                read_task = asyncio.create_task(self.read_loop(ws, idx))
+                conn = {
+                    "ws": ws,
+                    "read_task": read_task,
+                    "send_task": send_task,
+                    "ctrl_send_queue": ctrl_send_queue,
+                    "data_send_queue": data_send_queue,
+                }
+                self.conns[idx] = conn
+                return conn
+            except Exception as e:
+                logger.error(f"Failed to connect TCP tunnel {idx}: {e}")
+                self.conns[idx] = None
+                raise
+
+    async def open_session(self, host, port, stream_writer):
         sid = await self.get_session_id()
         async with self.lock:
             conn_idx = self.next_conn_index
@@ -225,19 +399,20 @@ class GlobalTCPTunnelManager:
             self.sid_to_conn_idx[sid] = conn_idx
             
         try:
-            ws = await self._ensure_conn(conn_idx)
+            conn = await self._ensure_conn(conn_idx)
         except Exception as e:
             logger.error(f"Failed to open TCP session [ensure_conn] for {host}:{port}: {e}")
+            self.sid_to_conn_idx.pop(sid, None)
             return None
 
-        # logger.info(f"tcp tunnenel: open session with stream: {stream}")
-        self.tcp_relay_sessions[sid] = stream
+        self.tcp_relay_sessions[sid] = {"writer": stream_writer, "drain_pending": 0}
         fut = asyncio.get_running_loop().create_future()
         self.pending_opens[sid] = fut
-        payload = {"type": "open", "sid": sid, "host": normalize_host(host), "port": port}
-        data = json.dumps(payload).encode("utf-8")
-        await ws.send_bytes(self.cipher.encrypt(data))
+
         try:
+            open_payload = pack_addr(normalize_host(host), port)
+            frame = pack_tcp_frame(TCP_FRAME_OPEN, sid, open_payload)
+            await conn["ctrl_send_queue"].put(frame)
             await asyncio.wait_for(fut, timeout=10)
             return sid
         except Exception as e:
@@ -249,20 +424,30 @@ class GlobalTCPTunnelManager:
             return None
 
     async def close_session(self, sid):
-        # logger.info(f"**************** close session: sid={sid}")
         conn_idx = self.sid_to_conn_idx.get(sid)
-        if conn_idx is not None and conn_idx < len(self.conns) and self.conns[conn_idx]:
-            ws = self.conns[conn_idx]["ws"]
-            payload = {"type": "close", "sid": sid}
-            data = json.dumps(payload).encode("utf-8")
+        if conn_idx is not None and conn_idx < len(self.conns):
+            conn = self.conns[conn_idx]
+        else:
+            conn = None
+
+        if conn:
             try:
-                await ws.send_bytes(self.cipher.encrypt(data))
+                frame = pack_tcp_frame(TCP_FRAME_CLOSE, sid)
+                await conn["ctrl_send_queue"].put(frame)
             except Exception:
                 pass
         
-        self.tcp_relay_sessions.pop(sid, None)
+        session = self.tcp_relay_sessions.pop(sid, None)
         self.pending_opens.pop(sid, None)
         self.sid_to_conn_idx.pop(sid, None)
+        if session:
+            writer = session.get("writer")
+            if writer:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def send_data(self, sid, data):
         conn_idx = self.sid_to_conn_idx.get(sid)
@@ -270,11 +455,11 @@ class GlobalTCPTunnelManager:
             return
         
         try:
-            ws = await self._ensure_conn(conn_idx)
-            packet = struct.pack("!I", sid) + data
-            encrypted = self.cipher.encrypt(packet)
-            await ws.send_bytes(encrypted)
-        except Exception:
+            conn = await self._ensure_conn(conn_idx)
+            frame = pack_tcp_frame(TCP_FRAME_DATA, sid, data)
+            await conn["data_send_queue"].put(frame)
+        except Exception as e:
+            logger.error(f"Failed to send data for SID {sid}: {e}")
             if conn_idx < len(self.conns):
                 self.conns[conn_idx] = None
 
@@ -282,68 +467,64 @@ class GlobalTCPTunnelManager:
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
-                    decrypted = self.cipher.decrypt(msg.data)
                     try:
-                        # logger.info(f"receive decrypted data: {decrypted}")
-                        # logger.info(f"receive decrypted data with sessions: {self.tcp_relay_sessions}")
-                        j = json.loads(decrypted)
-                        t = j.get("type")
-                        # logger.info(f"tcp tunnel: proxy-client receive {t} {type(t)}")
-                        # logger.info(decrypted)
-                        if t == "open_ack":
-                            sid = j.get("sid")
-                            status = j.get("status", "ok")
-                            fut = self.pending_opens.get(sid)
-                            if fut and not fut.done():
-                                if status == "ok":
-                                    fut.set_result(True)
-                                else:
-                                    fut.set_exception(
-                                        RuntimeError(j.get("message", "open session failed"))
-                                    )
-                        elif t == "close":
-                            sid = j.get("sid")
-                            # logger.info(f"tcp tunnel: close with sid {sid} {type(sid)} stream: {self.tcp_relay_sessions}")
-                            stream = self.tcp_relay_sessions.pop(sid, None)
-                            self.sid_to_conn_idx.pop(sid, None)
-                            # logger.info(f"stream: {stream}")
-                            if stream:
+                        decrypted = self.cipher.decrypt(msg.data)
+                        for frame_type, sid, payload in iter_tcp_frames(decrypted):
+                            if frame_type == TCP_FRAME_OPEN_ACK:
+                                fut = self.pending_opens.pop(sid, None)
+                                if fut and not fut.done():
+                                    ok, message = self._decode_open_ack(payload)
+                                    if ok:
+                                        fut.set_result(True)
+                                    else:
+                                        fut.set_exception(RuntimeError(message or "open session failed"))
+                            elif frame_type == TCP_FRAME_CLOSE:
+                                session = self.tcp_relay_sessions.pop(sid, None)
+                                self.sid_to_conn_idx.pop(sid, None)
+                                self.pending_opens.pop(sid, None)
+                                if session:
+                                    writer = session.get("writer")
+                                    if writer:
+                                        try:
+                                            writer.close()
+                                            await writer.wait_closed()
+                                        except Exception:
+                                            pass
+                            elif frame_type == TCP_FRAME_DATA:
+                                session = self.tcp_relay_sessions.get(sid)
+                                if not session:
+                                    continue
+                                writer = session.get("writer")
+                                if not writer:
+                                    continue
                                 try:
-                                    stream.writer.close()
-                                    await stream.writer.wait_closed()
+                                    writer.write(payload)
+                                    pending = session.get("drain_pending", 0) + len(payload)
+                                    transport = getattr(writer, "transport", None)
+                                    if pending >= TCP_LOCAL_DRAIN_THRESHOLD or (
+                                        transport and transport.get_write_buffer_size() >= TCP_LOCAL_BUFFER_THRESHOLD
+                                    ):
+                                        await writer.drain()
+                                        pending = 0
+                                    session["drain_pending"] = pending
                                 except Exception:
-                                    pass
+                                    self.tcp_relay_sessions.pop(sid, None)
+                                    self.sid_to_conn_idx.pop(sid, None)
+                                    self.pending_opens.pop(sid, None)
+                                    try:
+                                        writer.close()
+                                        await writer.wait_closed()
+                                    except Exception:
+                                        pass
                     except Exception as e:
-                        # logger.exception(e)
-                        if len(decrypted) < 4:
-                            continue
-                        
-                        # Use memoryview to avoid copies
-                        mv_decrypted = memoryview(decrypted)
-                        sid = struct.unpack("!I", mv_decrypted[:4])[0]
-                        payload = mv_decrypted[4:]
-                        
-                        # logger.info(f"before sessions.get {sid}: {self.tcp_relay_sessions}")
-                        stream = self.tcp_relay_sessions.get(sid)
-                        # logger.info(f"after sessions.get {sid}: {self.tcp_relay_sessions}")
-                        if stream:
-                            try:
-                                stream.writer.write(payload)
-                                await stream.writer.drain()
-                            except Exception as e:
-                                logger.error(e)
-                                pass
-                        # logger.info(f"continue ... with sessions: {self.tcp_relay_sessions}")
+                        logger.error(f"TCP tunnel {idx} read error: {e}")
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    # logger.info(f"msg.type: {msg.type}")
                     break
         except Exception as e:
-            logger.exception(e)
+            logger.error(f"TCP tunnel {idx} connection lost: {e}")
         finally:
-            # logger.info(f"************** ws end ****************")
-            async with self.lock:
-                if idx < len(self.conns) and self.conns[idx] and self.conns[idx]["ws"] == ws:
-                    self.conns[idx] = None
+            await self._mark_conn_disconnected(idx, ws)
+            await self._cleanup_conn_sessions(idx, f"tcp tunnel {idx} disconnected")
 
 
 class UDPClientProtocol(asyncio.DatagramProtocol):
@@ -487,9 +668,7 @@ class Socks5Proxy:
             return
 
         logger.info(f"[tcp] {dest_addr}:{dest_port}")
-        sid = await self.tcp_manager.open_session(
-            dest_addr, dest_port, type("S", (), {"writer": writer})()
-        )
+        sid = await self.tcp_manager.open_session(dest_addr, dest_port, writer)
         if not sid:
             logger.warning(f"Failed to open TCP session for {dest_addr}:{dest_port}")
             self.send_reply(writer, 0x01)
@@ -505,7 +684,7 @@ class Socks5Proxy:
                 while True:
                     try:
                         # logger.info(f"TCP client to tunnel: read and wait 600s for {dest_addr}:{dest_port}")
-                        data = await asyncio.wait_for(reader.read(16384), timeout=600)
+                        data = await asyncio.wait_for(reader.read(TCP_READ_CHUNK_SIZE), timeout=600)
                     except asyncio.TimeoutError:
                         # logger.warning(f"TCP client to tunnel: timeout with SID {sid} for {dest_addr}:{dest_port}")
                         break

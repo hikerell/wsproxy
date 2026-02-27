@@ -7,13 +7,13 @@ Use `/Users/hikerell/Workspace/wsproxy/scripts/wsproxy_bench.py` to stress test 
 Run echo server on target side:
 
 ```bash
-python3 /Users/hikerell/Workspace/wsproxy/scripts/wsproxy_bench.py echo-server --host 0.0.0.0 --port 19090
+python3 ./scripts/wsproxy_bench.py echo-server --host 0.0.0.0 --port 19090
 ```
 
 Run benchmark from client side (through wsproxy SOCKS5):
 
 ```bash
-python3 /Users/hikerell/Workspace/wsproxy/scripts/wsproxy_bench.py tcp-bench \
+python3 ./scripts/wsproxy_bench.py tcp-bench \
   --socks-host 127.0.0.1 \
   --socks-port 1080 \
   --target-host <TARGET_IP_OR_DOMAIN> \
