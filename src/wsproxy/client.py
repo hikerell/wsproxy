@@ -9,6 +9,7 @@ import time
 import aiohttp
 import argparse
 from wsproxy.crypto import Cipher
+from wsproxy.utils import normalize_host
 # from wsproxy.utils import hexdump
 
 logging.basicConfig(level=logging.INFO)
@@ -233,7 +234,7 @@ class GlobalTCPTunnelManager:
         self.tcp_relay_sessions[sid] = stream
         fut = asyncio.get_running_loop().create_future()
         self.pending_opens[sid] = fut
-        payload = {"type": "open", "sid": sid, "host": host, "port": port}
+        payload = {"type": "open", "sid": sid, "host": normalize_host(host), "port": port}
         data = json.dumps(payload).encode("utf-8")
         await ws.send_bytes(self.cipher.encrypt(data))
         try:
@@ -244,6 +245,7 @@ class GlobalTCPTunnelManager:
             logger.exception(e)
             self.tcp_relay_sessions.pop(sid, None)
             self.pending_opens.pop(sid, None)
+            self.sid_to_conn_idx.pop(sid, None)
             return None
 
     async def close_session(self, sid):
@@ -290,9 +292,15 @@ class GlobalTCPTunnelManager:
                         # logger.info(decrypted)
                         if t == "open_ack":
                             sid = j.get("sid")
+                            status = j.get("status", "ok")
                             fut = self.pending_opens.get(sid)
                             if fut and not fut.done():
-                                fut.set_result(True)
+                                if status == "ok":
+                                    fut.set_result(True)
+                                else:
+                                    fut.set_exception(
+                                        RuntimeError(j.get("message", "open session failed"))
+                                    )
                         elif t == "close":
                             sid = j.get("sid")
                             # logger.info(f"tcp tunnel: close with sid {sid} {type(sid)} stream: {self.tcp_relay_sessions}")
@@ -581,7 +589,7 @@ class Socks5Proxy:
 
         port_bytes = await reader.read(2)
         dest_port = struct.unpack("!H", port_bytes)[0]
-        return dest_addr, dest_port
+        return normalize_host(dest_addr), dest_port
 
     def send_reply(self, writer, rep_code):
         reply = struct.pack("!BBBB", 5, rep_code, 0, 1) + b"\x00\x00\x00\x00\x00\x00"

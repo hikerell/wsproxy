@@ -68,6 +68,26 @@ def unpack_addr(data):
     else:
         raise ValueError(f"Unknown address type: {atyp}")
 
+
+def normalize_host(host):
+    """
+    Normalize host literals for connection use.
+    - Convert IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4.
+    - Keep regular IPv4/IPv6/domain unchanged.
+    """
+    if not host:
+        return host
+
+    # Some callers may pass bracketed IPv6 literals.
+    h = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        ip = ipaddress.ip_address(h)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            return str(ip.ipv4_mapped)
+        return str(ip)
+    except ValueError:
+        return host
+
 def hexdump(data):
     """
     将字节序列以十六进制和可打印字符形式输出，类似 hexdump -C 的效果。

@@ -6,7 +6,7 @@ import argparse
 import socket
 import sys
 from aiohttp import web, WSMsgType
-from wsproxy.utils import pack_addr, unpack_addr
+from wsproxy.utils import pack_addr, unpack_addr, normalize_host
 from wsproxy.crypto import Cipher
 
 logging.basicConfig(level=logging.INFO)
@@ -195,7 +195,11 @@ async def proxy_handler(request):
                                     host = obj.get("host")
                                     port = obj.get("port")
                                     try:
-                                        r, w = await asyncio.open_connection(host, port)
+                                        normalized_host = normalize_host(host)
+                                        r, w = await asyncio.wait_for(
+                                            asyncio.open_connection(normalized_host, port),
+                                            timeout=10,
+                                        )
                                         # Enable TCP_NODELAY
                                         sock = w.get_extra_info("socket")
                                         if sock:
